@@ -44,21 +44,24 @@ pub enum AmmError {
     DeadlineExceeded = 405,
     /// `406` — Same-block bidirectional trades from the same origin address are prohibited.
     SameBlockBidirectionalTrade = 406,
-}
-
-pub mod anti_mev;
-    /// `405` — AMM operations are paused by the circuit breaker.
-    ContractPaused = 405,
-    /// `406` — Caller is not authorized to manage the circuit breaker.
-    Unauthorized = 406,
     /// `407` — The 24-hour token outflow budget has been exceeded.
     WithdrawalLimitExceeded = 407,
     /// `408` — Arithmetic overflow.
     Overflow = 408,
+    /// `409` — AMM operations are paused by the circuit breaker.
+    ContractPaused = 409,
+    /// `410` — Caller is not authorized to manage the circuit breaker.
+    Unauthorized = 410,
+    /// `411` — Reentrant calls are rejected.
+    ReentrancyGuardTriggered = 411,
+    /// `412` — Pool balances violate the reserve invariant.
+    InvariantViolated = 412,
 }
 
+pub mod anti_mev;
 pub mod circuit_breaker;
 pub mod events;
+pub mod invariants;
 pub mod storage;
 pub mod twap;
 
@@ -69,6 +72,20 @@ pub struct AMMContract;
 
 #[contractimpl]
 impl AMMContract {
+    fn lock(env: &Env) {
+        let key = soroban_sdk::symbol_short!("amm_rg");
+        if env.storage().temporary().has(&key) {
+            panic_with_error!(env, AmmError::ReentrancyGuardTriggered);
+        }
+        env.storage().temporary().set(&key, &true);
+    }
+
+    fn unlock(env: &Env) {
+        env.storage()
+            .temporary()
+            .remove(&soroban_sdk::symbol_short!("amm_rg"));
+    }
+
     /// Initializes the AMM with two tokens and mints dead shares to prevent share inflation.
     pub fn initialize(
         env: Env,
@@ -79,6 +96,7 @@ impl AMMContract {
         fee_collector: Address,
         base_fee_bps: i128,
     ) {
+        Self::lock(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, AmmError::AlreadyInitialized);
         }
@@ -119,21 +137,25 @@ impl AMMContract {
             &fee_collector,
             base_fee_bps,
         );
+        Self::unlock(&env);
     }
 
     /// Set the address authorized to trigger the emergency pause.
     pub fn set_guardian(env: Env, admin: Address, guardian: Address) {
+        Self::lock(&env);
         admin.require_auth();
         if admin != circuit_breaker::admin(&env) {
             panic_with_error!(&env, AmmError::Unauthorized);
         }
         circuit_breaker::set_guardian(&env, &guardian);
         events::guardian_changed(&env, &admin, &guardian);
+        Self::unlock(&env);
     }
 
     /// Pause swaps and liquidity changes immediately. The admin or designated
     /// guardian can pause; only the admin can unpause.
     pub fn set_paused(env: Env, caller: Address, paused: bool) {
+        Self::lock(&env);
         caller.require_auth();
         let is_admin = caller == circuit_breaker::admin(&env);
         if !is_admin && !circuit_breaker::is_guardian(&env, &caller) {
@@ -143,6 +165,7 @@ impl AMMContract {
             panic_with_error!(&env, AmmError::Unauthorized);
         }
         circuit_breaker::set_paused(&env, paused, &caller);
+        Self::unlock(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -158,6 +181,7 @@ impl AMMContract {
         min_shares: i128,
     ) -> i128 {
         provider.require_auth();
+        Self::lock(&env);
         circuit_breaker::assert_not_paused(&env);
         if amount_a <= 0 || amount_b <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
@@ -229,6 +253,8 @@ impl AMMContract {
         twap::update_cumulative_prices(&env, balance_a + amount_a, balance_b + amount_b);
 
         pool_share_client.mint(&provider, &shares);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
         events::liquidity_added(
             &env,
@@ -252,6 +278,7 @@ impl AMMContract {
         min_amount_b: i128,
     ) -> (i128, i128) {
         provider.require_auth();
+        Self::lock(&env);
         circuit_breaker::assert_not_paused(&env);
         if shares <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
@@ -300,6 +327,8 @@ impl AMMContract {
 
         token_a_client.transfer(&contract_addr, &provider, &amount_a);
         token_b_client.transfer(&contract_addr, &provider, &amount_b);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
         events::liquidity_removed(
             &env,
@@ -317,6 +346,7 @@ impl AMMContract {
     /// Swaps token A for token B with dynamic fee based on price impact.
     pub fn swap_a_for_b(env: Env, user: Address, amount_in: i128, min_amount_out: i128) -> i128 {
         user.require_auth();
+        Self::lock(&env);
         circuit_breaker::assert_not_paused(&env);
         if amount_in <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
@@ -374,6 +404,8 @@ impl AMMContract {
         let contract_addr = env.current_contract_address();
         token_b_client.transfer(&contract_addr, &user, &amount_out);
         token_b_client.transfer(&contract_addr, &fee_collector, &fee);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
         events::swap_a_for_b(
             &env,
@@ -403,6 +435,7 @@ impl AMMContract {
     /// Swaps token B for token A with dynamic fee based on price impact.
     pub fn swap_b_for_a(env: Env, user: Address, amount_in: i128, min_amount_out: i128) -> i128 {
         user.require_auth();
+        Self::lock(&env);
         circuit_breaker::assert_not_paused(&env);
         if amount_in <= 0 {
             panic_with_error!(&env, AmmError::InvalidAmount);
@@ -460,6 +493,8 @@ impl AMMContract {
         let contract_addr = env.current_contract_address();
         token_a_client.transfer(&contract_addr, &user, &amount_out);
         token_a_client.transfer(&contract_addr, &fee_collector, &fee);
+        invariants::assert_balance_reserve_invariant(&env);
+        Self::unlock(&env);
 
         events::swap_b_for_a(
             &env,
