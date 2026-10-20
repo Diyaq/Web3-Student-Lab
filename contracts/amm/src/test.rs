@@ -1,7 +1,24 @@
 use super::*;
 use contract_events::topic;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
-use soroban_sdk::{token, xdr, Address, Env, Symbol, TryFromVal, Val, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, token, xdr, Address, Env, Symbol, TryFromVal, Val, Vec,
+};
+
+#[contract]
+struct CallbackToken;
+
+#[contractimpl]
+impl CallbackToken {
+    pub fn transfer(env: Env, from: Address, _to: Address, _amount: i128) {
+        let pool: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("pool"))
+            .unwrap();
+        AMMContractClient::new(&env, &pool).swap_a_for_b(&from, &1, &0);
+    }
+}
 
 fn setup(
     env: &Env,
@@ -114,6 +131,57 @@ fn test_constant_product_invariant_swap() {
     // After swap, k should increase (fee collected is removed from B balance)
     // So k_after >= k_before (due to fee collection)
     assert!(k_after >= k_before);
+}
+
+#[test]
+fn test_token_callback_cannot_reenter_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let pool_id = env.register(AMMContract, ());
+    let pool = AMMContractClient::new(&env, &pool_id);
+    let callback_token = env.register(CallbackToken, ());
+    let token_b = env.register_stellar_asset_contract_v2(admin.clone());
+    let pool_share = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_b_id = token_b.address();
+    let pool_share_id = pool_share.address();
+    let fee_collector = Address::generate(&env);
+
+    env.as_contract(&callback_token, || {
+        env.storage()
+            .instance()
+            .set(&symbol_short!("pool"), &pool_id);
+    });
+    token::StellarAssetClient::new(&env, &token_b_id).mint(&admin, &1_000_000);
+    pool.initialize(
+        &admin,
+        &callback_token,
+        &token_b_id,
+        &pool_share_id,
+        &fee_collector,
+        &50,
+    );
+
+    let result = pool.try_add_liquidity(&admin, &1_000_000, &1_000_000, &0);
+    assert!(
+        result.is_err(),
+        "callback reentry must revert the outer call"
+    );
+    assert_eq!(pool.get_pool_state(), (0, 0, DEAD_SHARES));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #412)")]
+fn test_reserve_invariant_rejects_accounted_balance_above_reserve() {
+    let env = Env::default();
+    let pool_id = env.register(AMMContract, ());
+    env.as_contract(&pool_id, || {
+        env.storage().instance().set(&DataKey::BalanceA, &2i128);
+        env.storage().instance().set(&DataKey::BalanceB, &0i128);
+        env.storage().instance().set(&DataKey::ReserveA, &1i128);
+        env.storage().instance().set(&DataKey::ReserveB, &0i128);
+        invariants::assert_balance_reserve_invariant(&env);
+    });
 }
 
 #[test]

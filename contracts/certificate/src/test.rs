@@ -4,7 +4,8 @@ use super::*;
 use contract_events::topic;
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
-    xdr, Address, Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
+    xdr::{self, ToXdr},
+    Address, Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
 /// Helper harness to set up the Soroban environment, register the contract,
@@ -90,6 +91,38 @@ fn test_issue_certificate_success() {
     assert_eq!(log.action, String::from_str(&env, "ISSUED"));
     assert_eq!(log.actor, issuer);
     assert_eq!(log.reason, String::from_str(&env, ""));
+}
+
+#[test]
+fn compact_certificate_metadata_reduces_serialized_size_and_preserves_legacy_reads() {
+    let (env, client, _admin, issuer, owner) = setup_test();
+    let course_id = String::from_str(&env, "PACKED");
+    let content_hash = BytesN::from_array(&env, &[0xAB; 32]);
+    let cert_id = client.issue_certificate(&owner, &issuer, &course_id, &content_hash);
+    client.set_royalty_bps(&cert_id, &5_000);
+
+    let record = client.get_certificate(&cert_id);
+    assert_eq!(record.royalty_bps, 5_000);
+    assert_eq!(record.status, CertificateStatus::Active);
+    assert!(record.soulbound);
+
+    let compact = StoredCertificateRecord::from_record(&record);
+    assert!(compact.to_xdr(&env).len() < record.to_xdr(&env).len());
+    assert_eq!(
+        compact.clone().into_record(cert_id.clone()).royalty_bps,
+        5_000
+    );
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CompactCertificate(cert_id.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Certificate(cert_id.clone()), &record);
+    });
+    assert_eq!(client.get_certificate(&cert_id).royalty_bps, 5_000);
 }
 
 #[test]

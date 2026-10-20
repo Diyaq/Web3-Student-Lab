@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CertificateStatus {
     Active,
     Revoked,
@@ -35,6 +35,62 @@ pub struct CertificateRecord {
     /// is set once at issuance and can never be cleared — it is an
     /// immutable revocation of transferability, not a toggle.
     pub soulbound: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+struct StoredCertificateRecord {
+    owner: Address,
+    issuer: Address,
+    course_id: String,
+    issued_at: u64,
+    metadata: u32,
+    revocation_reason: String,
+    previous_cert_id: BytesN<32>,
+    content_hash: BytesN<32>,
+}
+
+impl StoredCertificateRecord {
+    fn from_record(record: &CertificateRecord) -> Self {
+        let status = match record.status {
+            CertificateStatus::Active => 0,
+            CertificateStatus::Revoked => 1,
+            CertificateStatus::Reissued => 2,
+            CertificateStatus::Expired => 3,
+        };
+        Self {
+            owner: record.owner.clone(),
+            issuer: record.issuer.clone(),
+            course_id: record.course_id.clone(),
+            issued_at: record.issued_at,
+            metadata: record.royalty_bps | (status << 13) | ((record.soulbound as u32) << 15),
+            revocation_reason: record.revocation_reason.clone(),
+            previous_cert_id: record.previous_cert_id.clone(),
+            content_hash: record.content_hash.clone(),
+        }
+    }
+
+    fn into_record(self, cert_id: BytesN<32>) -> CertificateRecord {
+        let status = match (self.metadata >> 13) & 0b11 {
+            0 => CertificateStatus::Active,
+            1 => CertificateStatus::Revoked,
+            2 => CertificateStatus::Reissued,
+            _ => CertificateStatus::Expired,
+        };
+        CertificateRecord {
+            cert_id,
+            owner: self.owner,
+            issuer: self.issuer,
+            course_id: self.course_id,
+            issued_at: self.issued_at,
+            status,
+            revocation_reason: self.revocation_reason,
+            previous_cert_id: self.previous_cert_id,
+            content_hash: self.content_hash,
+            royalty_bps: self.metadata & 0x1fff,
+            soulbound: (self.metadata & (1 << 15)) != 0,
+        }
+    }
 }
 
 /// Maximum royalty a creator may configure: 100.00% expressed in basis
@@ -107,14 +163,7 @@ impl CertificateContract {
             soulbound: true,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(cert_id_bytes.clone()), &record);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Certificate(cert_id_bytes.clone()),
-            500_000,
-            500_000,
-        );
+        Self::store_certificate(&env, &record);
 
         env.storage()
             .instance()
@@ -140,11 +189,7 @@ impl CertificateContract {
     }
 
     pub fn revoke_certificate(env: Env, cert_id: BytesN<32>, reason_code: String) {
-        let mut record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let mut record = Self::load_certificate(&env, &cert_id);
         if record.status == CertificateStatus::Revoked {
             panic_with_error!(&env, Error::AlreadyRevoked);
         }
@@ -153,9 +198,7 @@ impl CertificateContract {
 
         record.status = CertificateStatus::Revoked;
         record.revocation_reason = reason_code.clone();
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(cert_id.clone()), &record);
+        Self::store_certificate(&env, &record);
 
         Self::log_audit(
             &env,
@@ -178,11 +221,7 @@ impl CertificateContract {
         old_cert_id: BytesN<32>,
         new_content_hash: BytesN<32>,
     ) -> BytesN<32> {
-        let mut old_record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(old_cert_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let mut old_record = Self::load_certificate(&env, &old_cert_id);
         if old_record.status != CertificateStatus::Revoked {
             panic_with_error!(&env, Error::NotRevoked);
         }
@@ -212,23 +251,13 @@ impl CertificateContract {
             soulbound: true,
         };
 
-        env.storage().persistent().set(
-            &DataKey::Certificate(new_cert_id_bytes.clone()),
-            &new_record,
-        );
-        env.storage().persistent().extend_ttl(
-            &DataKey::Certificate(new_cert_id_bytes.clone()),
-            500_000,
-            500_000,
-        );
+        Self::store_certificate(&env, &new_record);
         env.storage()
             .instance()
             .set(&DataKey::NextCertId, &(new_cert_id + 1));
 
         old_record.status = CertificateStatus::Reissued;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(old_cert_id.clone()), &old_record);
+        Self::store_certificate(&env, &old_record);
 
         Self::log_audit(
             &env,
@@ -284,24 +313,27 @@ impl CertificateContract {
             .unwrap_or_else(|| panic_with_error!(&env, Error::CohortNotFound));
         let mut current = leaf_hash;
         for sibling in proof.iter() {
-            let mut combined = Bytes::new(&env);
-            if current.to_array() < sibling.to_array() {
-                combined.append(&current.clone().into());
-                combined.append(&sibling.clone().into());
-            } else {
-                combined.append(&sibling.clone().into());
-                combined.append(&current.clone().into());
-            }
-            current = env.crypto().sha256(&combined).into();
+            current = Self::hash_pair(&env, &current, &sibling);
         }
         current == root_entry.root_hash
     }
 
+    fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
+        let left = left.to_array();
+        let right = right.to_array();
+        let mut pair = [0u8; 64];
+        if left < right {
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+        } else {
+            pair[..32].copy_from_slice(&right);
+            pair[32..].copy_from_slice(&left);
+        }
+        env.crypto().sha256(&Bytes::from_array(env, &pair)).into()
+    }
+
     pub fn get_certificate(env: Env, cert_id: BytesN<32>) -> CertificateRecord {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound))
+        Self::load_certificate(&env, &cert_id)
     }
 
     pub fn get_merkle_root(env: Env, cohort_id: String) -> MerkleCohortRoot {
@@ -315,11 +347,7 @@ impl CertificateContract {
     /// certificate, in basis points. Only the original issuer may call
     /// this, and only while the certificate is `Active`.
     pub fn set_royalty_bps(env: Env, cert_id: BytesN<32>, royalty_bps: u32) {
-        let mut record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let mut record = Self::load_certificate(&env, &cert_id);
 
         record.issuer.require_auth();
 
@@ -328,9 +356,7 @@ impl CertificateContract {
         }
 
         record.royalty_bps = royalty_bps;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Certificate(cert_id.clone()), &record);
+        Self::store_certificate(&env, &record);
         events::royalty_updated(&env, &record.owner, &cert_id, &record.issuer, royalty_bps);
     }
 
@@ -338,11 +364,7 @@ impl CertificateContract {
     /// `sale_amount`. Returns `(creator_cut, seller_proceeds)`; the two
     /// always sum to `sale_amount`.
     pub fn calculate_royalty(env: Env, cert_id: BytesN<32>, sale_amount: i128) -> (i128, i128) {
-        let record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let record = Self::load_certificate(&env, &cert_id);
 
         if sale_amount <= 0 {
             return (0, 0);
@@ -358,11 +380,7 @@ impl CertificateContract {
     /// standard way to probe (and fail loudly on) transferability instead
     /// of relying on the absence of a `transfer` function.
     pub fn transfer_certificate(env: Env, cert_id: BytesN<32>, _to: Address) {
-        let record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let record = Self::load_certificate(&env, &cert_id);
 
         if record.soulbound {
             panic_with_error!(&env, Error::SoulboundNonTransferable);
@@ -375,11 +393,7 @@ impl CertificateContract {
     /// Returns `true` if the certificate is soulbound (non-transferable).
     /// Certificates issued by this contract are always soulbound.
     pub fn is_soulbound(env: Env, cert_id: BytesN<32>) -> bool {
-        let record: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Certificate(cert_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        let record = Self::load_certificate(&env, &cert_id);
         record.soulbound
     }
 
@@ -412,6 +426,33 @@ impl CertificateContract {
             500_000,
         );
     }
+
+    fn load_certificate(env: &Env, cert_id: &BytesN<32>) -> CertificateRecord {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StoredCertificateRecord>(&DataKey::CompactCertificate(cert_id.clone()))
+        {
+            return record.into_record(cert_id.clone());
+        }
+        env.storage()
+            .persistent()
+            .get::<DataKey, CertificateRecord>(&DataKey::Certificate(cert_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotFound))
+    }
+
+    fn store_certificate(env: &Env, record: &CertificateRecord) {
+        let key = DataKey::CompactCertificate(record.cert_id.clone());
+        env.storage()
+            .persistent()
+            .set(&key, &StoredCertificateRecord::from_record(record));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 500_000, 500_000);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Certificate(record.cert_id.clone()));
+    }
 }
 
 #[contracttype]
@@ -420,6 +461,7 @@ pub enum DataKey {
     Admin,
     NextCertId,
     Certificate(BytesN<32>),
+    CompactCertificate(BytesN<32>),
     MerkleRoot(String),
     AuditLog(BytesN<32>),
 }
